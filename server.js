@@ -3,7 +3,7 @@ const fs   = require('fs');
 const WebSocket = require('ws');
 
 const PORT       = 3000;
-const R          = 5;          // sphere radius (world units)
+const R          = 1;          // sphere radius (world units)
 const MOVE_SPD   = 0.025;      // radians/tick
 const TURN_SPD   = 0.06;
 const PROJ_SPD   = 0.05;

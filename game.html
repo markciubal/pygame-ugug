@@ -13,6 +13,7 @@ body { background:#000; overflow:hidden; }
 #xhair::after  { left:9px; top:0; bottom:0; width:2px; }
 #overlay { position:fixed; inset:0; background:rgba(0,0,0,.75); display:flex; flex-direction:column; align-items:center; justify-content:center; color:#fff; font:22px Arial; gap:12px; cursor:pointer; }
 #overlay small { font-size:14px; opacity:.7; }
+#compass { position:fixed; bottom:16px; right:16px; width:110px; height:110px; pointer-events:none; }
 </style>
 </head>
 <body>
@@ -22,18 +23,20 @@ body { background:#000; overflow:hidden; }
   <small>WASD = move &nbsp;|&nbsp; Mouse = turn &nbsp;|&nbsp; Click / Space = throw</small>
 </div>
 <div id="xhair"></div>
+<canvas id="compass" width="110" height="110"></canvas>
 <div id="hud">
   <div id="h-score">Score: 0</div>
   <div id="h-health">Health: ♥♥♥</div>
   <div id="h-throw">Ready</div>
+  <div id="h-coords" style="opacity:.75;font-size:12px"></div>
   <div id="h-players"></div>
 </div>
 
 <script src="https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.min.js"></script>
 <script>
 // ── Constants ──────────────────────────────────────────────────────────────────
-const SR       = 5;     // sphere radius
-const EYE      = 0.13;  // camera height above surface
+const SR       = 1;     // sphere radius
+const EYE      = 0.026; // camera height above surface
 const TURN_SPD = 0.06;
 const MOVE_SPD = 0.025;
 const THROW_CD = 1200;  // ms
@@ -48,17 +51,17 @@ document.body.appendChild(renderer.domElement);
 const scene = new THREE.Scene();
 scene.background = new THREE.Color(0x060c1a);
 
-const camera = new THREE.PerspectiveCamera(80, innerWidth/innerHeight, 0.01, 200);
+const camera = new THREE.PerspectiveCamera(80, innerWidth/innerHeight, 0.001, 40);
 
 // Stars
 const sg = new THREE.BufferGeometry();
 const sv = [];
 for (let i=0;i<2000;i++) {
-  const th=Math.random()*Math.PI*2, ph=Math.acos(2*Math.random()-1), r=60+Math.random()*20;
+  const th=Math.random()*Math.PI*2, ph=Math.acos(2*Math.random()-1), r=12+Math.random()*4;
   sv.push(Math.sin(ph)*Math.cos(th)*r, Math.cos(ph)*r, Math.sin(ph)*Math.sin(th)*r);
 }
 sg.setAttribute('position', new THREE.Float32BufferAttribute(sv,3));
-scene.add(new THREE.Points(sg, new THREE.PointsMaterial({color:0xffffff,size:0.1})));
+scene.add(new THREE.Points(sg, new THREE.PointsMaterial({color:0xffffff,size:0.02})));
 
 // Sphere
 const sphere = new THREE.Mesh(
@@ -75,7 +78,7 @@ scene.add(new THREE.Mesh(
 // Lights
 scene.add(new THREE.AmbientLight(0x334455, 1.2));
 const sun = new THREE.DirectionalLight(0xffeedd, 1.8);
-sun.position.set(8, 20, 5);
+sun.position.set(1.6, 4, 1);
 scene.add(sun);
 
 // ── Helpers ────────────────────────────────────────────────────────────────────
@@ -95,10 +98,123 @@ function tangent(th, ph, facing) {
     cd*(cp*st) + sd*(ct)
   );
 }
-function placeOnSphere(obj, th, ph, h=0.15) {
+function placeOnSphere(obj, th, ph, h=0.03) {
   const pos = sph2v3(th, ph, SR+h);
   obj.position.copy(pos);
   obj.quaternion.setFromUnitVectors(new THREE.Vector3(0,1,0), pos.clone().normalize());
+}
+
+// ── Navigation math ────────────────────────────────────────────────────────────
+
+// Spherical coords → lat/lon display strings
+function toLatLon(th, ph) {
+  const lat = 90 - ph * (180/Math.PI);
+  const lon = th * (180/Math.PI);
+  const NS = lat >= 0 ? 'N' : 'S', EW = lon <= 180 ? 'E' : 'W';
+  return `${Math.abs(lat).toFixed(1)}°${NS}  ${(lon > 180 ? 360-lon : lon).toFixed(1)}°${EW}`;
+}
+
+// Absolute bearing (radians, 0=North, CW) from player's facing
+function facingToBearing(facing) {
+  return ((Math.PI - facing) % (Math.PI*2) + Math.PI*2) % (Math.PI*2);
+}
+
+// Great-circle bearing FROM (th1,ph1) TO (th2,ph2), 0=North clockwise
+function bearingTo(th1, ph1, th2, ph2) {
+  const s = (v) => [Math.sin(v[1])*Math.cos(v[0]), Math.cos(v[1]), Math.sin(v[1])*Math.sin(v[0])];
+  const p1=s([th1,ph1]), p2=s([th2,ph2]);
+  const dot = p1[0]*p2[0]+p1[1]*p2[1]+p1[2]*p2[2];
+  // Tangent toward p2 in p1's tangent plane
+  const tx=p2[0]-dot*p1[0], ty=p2[1]-dot*p1[1], tz=p2[2]-dot*p1[2];
+  const m=Math.sqrt(tx*tx+ty*ty+tz*tz);
+  if (m<1e-6) return 0;
+  const cp=Math.cos(ph1),sp=Math.sin(ph1),ct=Math.cos(th1),st=Math.sin(th1);
+  const eSouth=[cp*ct,-sp,cp*st], eEast=[-st,0,ct];
+  const south=(tx*eSouth[0]+ty*eSouth[1]+tz*eSouth[2])/m;
+  const east =(tx*eEast[0] +ty*eEast[1] +tz*eEast[2])/m;
+  return ((Math.atan2(east,-south) % (Math.PI*2))+Math.PI*2)%(Math.PI*2);
+}
+
+function angDist(th1,ph1,th2,ph2) {
+  const s=(v)=>[Math.sin(v[1])*Math.cos(v[0]),Math.cos(v[1]),Math.sin(v[1])*Math.sin(v[0])];
+  const p=s([th1,ph1]),q=s([th2,ph2]);
+  return Math.acos(Math.max(-1,Math.min(1, p[0]*q[0]+p[1]*q[1]+p[2]*q[2])));
+}
+
+// ── Compass ────────────────────────────────────────────────────────────────────
+const compassCanvas = document.getElementById('compass');
+const cc = compassCanvas.getContext('2d');
+const CW = compassCanvas.width, CH = compassCanvas.height;
+const CR = CW/2 - 4;
+
+function drawCompass(me, players) {
+  cc.clearRect(0,0,CW,CH);
+  const cx=CW/2, cy=CH/2;
+
+  // Background
+  cc.beginPath(); cc.arc(cx,cy,CR,0,Math.PI*2);
+  cc.fillStyle='rgba(0,0,0,0.65)'; cc.fill();
+  cc.strokeStyle='rgba(255,255,255,0.25)'; cc.lineWidth=1; cc.stroke();
+
+  // Player bearing (compass heading): 0 = North, CW
+  const bearing = facingToBearing(me.facing);
+
+  // Rotate disk so North stays at its true position
+  cc.save();
+  cc.translate(cx, cy);
+  cc.rotate(-bearing);
+
+  // Tick marks every 30°
+  for (let a=0; a<360; a+=30) {
+    const rad=a*Math.PI/180, len=a%90===0?7:4;
+    cc.beginPath();
+    cc.moveTo(Math.sin(rad)*(CR-1), -Math.cos(rad)*(CR-1));
+    cc.lineTo(Math.sin(rad)*(CR-1-len), -Math.cos(rad)*(CR-1-len));
+    cc.strokeStyle='rgba(255,255,255,0.5)'; cc.lineWidth=1; cc.stroke();
+  }
+
+  // Cardinal labels
+  [['N',0,'#ff5555'],['E',90,'#fff'],['S',180,'#fff'],['W',270,'#fff']].forEach(([lbl,deg,col])=>{
+    const r=deg*Math.PI/180, d=CR-14;
+    cc.fillStyle=col; cc.font=`bold 11px Arial`;
+    cc.textAlign='center'; cc.textBaseline='middle';
+    cc.fillText(lbl, Math.sin(r)*d, -Math.cos(r)*d);
+  });
+
+  cc.restore();
+
+  // Other player dots (relative to our bearing)
+  for (const [pid, p] of Object.entries(players)) {
+    if (+pid === myPid) continue;
+    const abs = bearingTo(me.th, me.ph, p.th, p.ph);  // absolute bearing to them
+    const rel = abs - bearing;                           // relative to our forward
+    const dist = angDist(me.th, me.ph, p.th, p.ph);
+    // Map distance to radius: π apart = edge, nearby = near center
+    const dotR = Math.min(CR-10, dist / Math.PI * (CR-10));
+    const dotX = cx + Math.sin(rel)*dotR;
+    const dotY = cy - Math.cos(rel)*dotR;
+    const hex = COLORS[+pid % COLORS.length].toString(16).padStart(6,'0');
+    cc.beginPath(); cc.arc(dotX, dotY, 5, 0, Math.PI*2);
+    cc.fillStyle='#'+hex; cc.fill();
+    cc.strokeStyle='#fff'; cc.lineWidth=0.5; cc.stroke();
+    // Distance label
+    const deg = Math.round(dist*180/Math.PI);
+    cc.fillStyle='rgba(255,255,255,0.7)'; cc.font='9px Arial';
+    cc.textAlign='center'; cc.textBaseline='top';
+    cc.fillText(deg+'°', dotX, dotY+6);
+  }
+
+  // Forward arrow (fixed, pointing up)
+  cc.fillStyle='rgba(255,255,255,0.9)';
+  cc.beginPath();
+  cc.moveTo(cx, cy-CR+4);
+  cc.lineTo(cx-4, cy-CR+13);
+  cc.lineTo(cx+4, cy-CR+13);
+  cc.closePath(); cc.fill();
+
+  // Center dot (you)
+  cc.beginPath(); cc.arc(cx,cy,4,0,Math.PI*2);
+  cc.fillStyle='#ff4444'; cc.fill();
 }
 
 // ── Player meshes ──────────────────────────────────────────────────────────────
@@ -107,10 +223,10 @@ function getOrCreatePlayer(pid, color) {
   if (pMeshes[pid]) return pMeshes[pid];
   const g = new THREE.Group();
   const mat = new THREE.MeshLambertMaterial({ color: COLORS[pid % COLORS.length] });
-  const body = new THREE.Mesh(new THREE.CylinderGeometry(0.07,0.07,0.28,8), mat);
-  body.position.y = 0.14;
-  const head = new THREE.Mesh(new THREE.SphereGeometry(0.09,8,8), mat);
-  head.position.y = 0.37;
+  const body = new THREE.Mesh(new THREE.CylinderGeometry(0.014,0.014,0.056,8), mat);
+  body.position.y = 0.028;
+  const head = new THREE.Mesh(new THREE.SphereGeometry(0.018,8,8), mat);
+  head.position.y = 0.074;
   g.add(body, head);
   scene.add(g);
   pMeshes[pid] = g;
@@ -119,7 +235,7 @@ function getOrCreatePlayer(pid, color) {
 
 // ── Projectile meshes ──────────────────────────────────────────────────────────
 const projMeshes = {};
-const projGeo = new THREE.SphereGeometry(0.07,6,6);
+const projGeo = new THREE.SphereGeometry(0.014,6,6);
 const projMat = new THREE.MeshBasicMaterial({ color:0xffdd00 });
 function getOrCreateProj(id) {
   if (projMeshes[id]) return projMeshes[id];
@@ -193,6 +309,8 @@ function loop() {
       document.getElementById('h-health').textContent = `Health: ${'♥'.repeat(Math.max(0,me.health))}${'·'.repeat(3-Math.max(0,me.health))}`;
       const cd = Math.max(0, THROW_CD-(Date.now()-lastThrow));
       document.getElementById('h-throw').textContent  = cd>0 ? `Reload: ${(cd/1000).toFixed(1)}s` : 'Ready';
+      document.getElementById('h-coords').textContent = toLatLon(me.th, me.ph);
+      drawCompass(me, players);
     }
 
     // Other players
@@ -212,7 +330,7 @@ function loop() {
     const seenPrj = new Set();
     for (const pr of (projs||[])) {
       seenPrj.add(pr.id);
-      placeOnSphere(getOrCreateProj(pr.id), pr.th, pr.ph, 0.1);
+      placeOnSphere(getOrCreateProj(pr.id), pr.th, pr.ph, 0.02);
     }
     for (const id of Object.keys(projMeshes)) {
       if (!seenPrj.has(+id)) removeProj(+id);
