@@ -1,0 +1,238 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>SphereWar</title>
+<style>
+* { margin:0; padding:0; box-sizing:border-box; }
+body { background:#000; overflow:hidden; }
+#hud { position:fixed; top:12px; left:12px; color:#fff; font:14px/1.6 Arial; text-shadow:1px 1px 3px #000; pointer-events:none; }
+#xhair { position:fixed; top:50%; left:50%; width:20px; height:20px; translate:-50% -50%; pointer-events:none; }
+#xhair::before,#xhair::after { content:''; position:absolute; background:rgba(255,255,255,0.85); }
+#xhair::before { top:9px; left:0; right:0; height:2px; }
+#xhair::after  { left:9px; top:0; bottom:0; width:2px; }
+#overlay { position:fixed; inset:0; background:rgba(0,0,0,.75); display:flex; flex-direction:column; align-items:center; justify-content:center; color:#fff; font:22px Arial; gap:12px; cursor:pointer; }
+#overlay small { font-size:14px; opacity:.7; }
+</style>
+</head>
+<body>
+<div id="overlay">
+  <div>🌍 SphereWar</div>
+  <div>Click to play</div>
+  <small>WASD = move &nbsp;|&nbsp; Mouse = turn &nbsp;|&nbsp; Click / Space = throw</small>
+</div>
+<div id="xhair"></div>
+<div id="hud">
+  <div id="h-score">Score: 0</div>
+  <div id="h-health">Health: ♥♥♥</div>
+  <div id="h-throw">Ready</div>
+  <div id="h-players"></div>
+</div>
+
+<script src="https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.min.js"></script>
+<script>
+// ── Constants ──────────────────────────────────────────────────────────────────
+const SR       = 5;     // sphere radius
+const EYE      = 0.13;  // camera height above surface
+const TURN_SPD = 0.06;
+const MOVE_SPD = 0.025;
+const THROW_CD = 1200;  // ms
+const COLORS   = [0xff4444,0x4488ff,0x44cc55,0xffcc00,0xcc44cc,0x44cccc,0xff8844,0x88ccff];
+
+// ── Three.js ───────────────────────────────────────────────────────────────────
+const renderer = new THREE.WebGLRenderer({ antialias:true });
+renderer.setPixelRatio(devicePixelRatio);
+renderer.setSize(innerWidth, innerHeight);
+document.body.appendChild(renderer.domElement);
+
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0x060c1a);
+
+const camera = new THREE.PerspectiveCamera(80, innerWidth/innerHeight, 0.01, 200);
+
+// Stars
+const sg = new THREE.BufferGeometry();
+const sv = [];
+for (let i=0;i<2000;i++) {
+  const th=Math.random()*Math.PI*2, ph=Math.acos(2*Math.random()-1), r=60+Math.random()*20;
+  sv.push(Math.sin(ph)*Math.cos(th)*r, Math.cos(ph)*r, Math.sin(ph)*Math.sin(th)*r);
+}
+sg.setAttribute('position', new THREE.Float32BufferAttribute(sv,3));
+scene.add(new THREE.Points(sg, new THREE.PointsMaterial({color:0xffffff,size:0.1})));
+
+// Sphere
+const sphere = new THREE.Mesh(
+  new THREE.SphereGeometry(SR, 48, 32),
+  new THREE.MeshLambertMaterial({ color:0x2d6a2d })
+);
+scene.add(sphere);
+// Grid overlay
+scene.add(new THREE.Mesh(
+  new THREE.SphereGeometry(SR*1.001, 24, 16),
+  new THREE.MeshBasicMaterial({ color:0x3d8a3d, wireframe:true, transparent:true, opacity:0.25 })
+));
+
+// Lights
+scene.add(new THREE.AmbientLight(0x334455, 1.2));
+const sun = new THREE.DirectionalLight(0xffeedd, 1.8);
+sun.position.set(8, 20, 5);
+scene.add(sun);
+
+// ── Helpers ────────────────────────────────────────────────────────────────────
+function sph2v3(th, ph, r=SR) {
+  return new THREE.Vector3(
+    Math.sin(ph)*Math.cos(th)*r,
+    Math.cos(ph)*r,
+    Math.sin(ph)*Math.sin(th)*r
+  );
+}
+function tangent(th, ph, facing) {
+  const cp=Math.cos(ph),sp=Math.sin(ph),ct=Math.cos(th),st=Math.sin(th);
+  const cd=Math.cos(facing),sd=Math.sin(facing);
+  return new THREE.Vector3(
+    cd*(cp*ct) + sd*(-st),
+    cd*(-sp),
+    cd*(cp*st) + sd*(ct)
+  );
+}
+function placeOnSphere(obj, th, ph, h=0.15) {
+  const pos = sph2v3(th, ph, SR+h);
+  obj.position.copy(pos);
+  obj.quaternion.setFromUnitVectors(new THREE.Vector3(0,1,0), pos.clone().normalize());
+}
+
+// ── Player meshes ──────────────────────────────────────────────────────────────
+const pMeshes = {};
+function getOrCreatePlayer(pid, color) {
+  if (pMeshes[pid]) return pMeshes[pid];
+  const g = new THREE.Group();
+  const mat = new THREE.MeshLambertMaterial({ color: COLORS[pid % COLORS.length] });
+  const body = new THREE.Mesh(new THREE.CylinderGeometry(0.07,0.07,0.28,8), mat);
+  body.position.y = 0.14;
+  const head = new THREE.Mesh(new THREE.SphereGeometry(0.09,8,8), mat);
+  head.position.y = 0.37;
+  g.add(body, head);
+  scene.add(g);
+  pMeshes[pid] = g;
+  return g;
+}
+
+// ── Projectile meshes ──────────────────────────────────────────────────────────
+const projMeshes = {};
+const projGeo = new THREE.SphereGeometry(0.07,6,6);
+const projMat = new THREE.MeshBasicMaterial({ color:0xffdd00 });
+function getOrCreateProj(id) {
+  if (projMeshes[id]) return projMeshes[id];
+  const m = new THREE.Mesh(projGeo, projMat);
+  scene.add(m);
+  projMeshes[id] = m;
+  return m;
+}
+function removeProj(id) {
+  if (projMeshes[id]) { scene.remove(projMeshes[id]); delete projMeshes[id]; }
+}
+
+// ── Input ──────────────────────────────────────────────────────────────────────
+const keys = {};
+let mouseDX = 0, locked = false, lastThrow = 0, myPid = null, lastState = null;
+
+addEventListener('keydown', e => { keys[e.code]=true; if(e.code==='Space') { e.preventDefault(); doThrow(); }});
+addEventListener('keyup',   e => { keys[e.code]=false; });
+addEventListener('mousemove', e => { if(locked) mouseDX += e.movementX; });
+addEventListener('mousedown', e => { if(locked && e.button===0) doThrow(); });
+
+document.getElementById('overlay').addEventListener('click', () =>
+  renderer.domElement.requestPointerLock());
+
+document.addEventListener('pointerlockchange', () => {
+  locked = document.pointerLockElement === renderer.domElement;
+  document.getElementById('overlay').style.display = locked ? 'none' : 'flex';
+});
+
+function doThrow() {
+  if (Date.now()-lastThrow < THROW_CD || !ws || ws.readyState!==1) return;
+  lastThrow = Date.now();
+  ws.send(JSON.stringify({ type:'throw' }));
+}
+
+// ── WebSocket ──────────────────────────────────────────────────────────────────
+const ws = new WebSocket(`ws://${location.host}`);
+ws.onmessage = e => {
+  const msg = JSON.parse(e.data);
+  if (msg.type === 'welcome') { myPid = msg.pid; }
+  else if (msg.type === 'state') { lastState = msg; }
+};
+
+// Send input 20x/sec
+setInterval(() => {
+  if (!ws||ws.readyState!==1||myPid===null) return;
+  const turn = (keys['KeyD']||keys['ArrowRight']?1:0) - (keys['KeyA']||keys['ArrowLeft']?1:0)
+             + mouseDX * 0.004;
+  const move = (keys['KeyW']||keys['ArrowUp']?1:0) - (keys['KeyS']||keys['ArrowDown']?1:0);
+  mouseDX = 0;
+  if (turn||move) ws.send(JSON.stringify({ type:'input', turn, move }));
+}, 50);
+
+// ── Render loop ────────────────────────────────────────────────────────────────
+function loop() {
+  requestAnimationFrame(loop);
+
+  if (lastState && myPid !== null) {
+    const { players, projs } = lastState;
+    const me = players[myPid];
+
+    if (me) {
+      // First-person camera
+      const pos = sph2v3(me.th, me.ph, SR+EYE);
+      camera.position.copy(pos);
+      camera.up.copy(pos).normalize();
+      camera.lookAt(pos.clone().add(tangent(me.th, me.ph, me.facing)));
+
+      // HUD
+      document.getElementById('h-score').textContent  = `Score: ${me.score}`;
+      document.getElementById('h-health').textContent = `Health: ${'♥'.repeat(Math.max(0,me.health))}${'·'.repeat(3-Math.max(0,me.health))}`;
+      const cd = Math.max(0, THROW_CD-(Date.now()-lastThrow));
+      document.getElementById('h-throw').textContent  = cd>0 ? `Reload: ${(cd/1000).toFixed(1)}s` : 'Ready';
+    }
+
+    // Other players
+    const seenP = new Set();
+    for (const [pid, p] of Object.entries(players)) {
+      if (+pid===myPid) continue;
+      seenP.add(+pid);
+      const mesh = getOrCreatePlayer(+pid);
+      placeOnSphere(mesh, p.th, p.ph);
+      mesh.visible = true;
+    }
+    for (const pid of Object.keys(pMeshes)) {
+      if (!seenP.has(+pid)) pMeshes[pid].visible = false;
+    }
+
+    // Projectiles
+    const seenPrj = new Set();
+    for (const pr of (projs||[])) {
+      seenPrj.add(pr.id);
+      placeOnSphere(getOrCreateProj(pr.id), pr.th, pr.ph, 0.1);
+    }
+    for (const id of Object.keys(projMeshes)) {
+      if (!seenPrj.has(+id)) removeProj(+id);
+    }
+
+    // Scoreboard
+    const lines = Object.entries(players).map(([id,p]) =>
+      `${+id===myPid?'▶ ':'  '}P${id}: ${p.score}pts ${'♥'.repeat(Math.max(0,p.health))}`);
+    document.getElementById('h-players').textContent = lines.join('\n');
+  }
+
+  renderer.render(scene, camera);
+}
+loop();
+
+addEventListener('resize', () => {
+  camera.aspect = innerWidth/innerHeight;
+  camera.updateProjectionMatrix();
+  renderer.setSize(innerWidth, innerHeight);
+});
+</script>
+</body>
+</html>
